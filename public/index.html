@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevShield: live traffic visualizer</title>
+<style>
+  :root {
+    --bg: #070b14; --panel: rgba(12, 20, 38, .84); --line: rgba(120, 160, 255, .2);
+    --text: #e6edf7; --muted: #8da2c0; --ok: #2ee59d; --bad: #ff4d6d;
+    --cache: #38bdf8; --db: #fbbf24; --req: #7dd3fc; --put: #c084fc;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  canvas#scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  canvas#scene:active { cursor: grabbing; }
+  .panel { position: fixed; background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px 16px; backdrop-filter: blur(8px); }
+  #controls { top: 16px; left: 16px; width: 290px; }
+  #stats { top: 16px; right: 16px; width: 270px; }
+  #legend { bottom: 16px; left: 16px; font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; max-width: 520px; }
+  #logbox { bottom: 16px; right: 16px; width: 330px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  h1 { font-size: 17px; margin: 0 0 2px; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 12px; margin: 0 0 12px; line-height: 1.4; }
+  label { font-size: 12px; color: var(--muted); display: block; margin: 8px 0 4px; }
+  select, button { font: inherit; font-size: 13px; border-radius: 9px; border: 1px solid var(--line);
+    background: rgba(30, 45, 80, .6); color: var(--text); padding: 9px 11px; }
+  select { width: 100%; }
+  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  button { cursor: pointer; transition: background .15s, transform .05s; }
+  button:hover { background: rgba(56, 90, 160, .7); }
+  button:active { transform: scale(.97); }
+  button.danger { border-color: rgba(255, 77, 109, .5); }
+  button.on { background: rgba(255, 77, 109, .35); border-color: var(--bad); }
+  button.wide { grid-column: span 2; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+  .row b { font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .cache { color: var(--cache); } .db { color: var(--db); }
+  .meter { height: 12px; border-radius: 8px; background: rgba(255, 255, 255, .08); overflow: hidden; margin: 6px 0 4px; }
+  #tokfill { height: 100%; width: 100%; background: linear-gradient(90deg, #2ee59d, #38bdf8); transition: background .2s; }
+  #tokfill.low { background: linear-gradient(90deg, #ff4d6d, #fb923c); }
+  .tiny { font-size: 11px; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
+  #log div { padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #nogl { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 30px; }
+  #toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--line);
+    padding: 9px 16px; border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+  @media (max-width: 900px) {
+    #stats { top: auto; bottom: 150px; right: 10px; width: 210px; }
+    #controls { left: 10px; top: 10px; width: 240px; }
+    #logbox, #legend { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="nogl" hidden><div><h1>WebGL is not available</h1><p class="sub">Open this page in a recent Chrome, Edge, Firefox or Safari with hardware acceleration on.</p></div></div>
+<div id="toast"></div>
+
+<div class="panel" id="controls">
+  <h1>DevShield</h1>
+  <p class="sub">Every packet is a real request to this server. Watch the rate limiter and the cache decide its fate.</p>
+  <label for="prod">Product to request</label>
+  <select id="prod">
+    <option value="1">Product 1 (hot, cached after first hit)</option>
+    <option value="2">Product 2</option>
+    <option value="3">Product 3</option>
+    <option value="rand">Random 1 to 100 (mostly cache MISS)</option>
+  </select>
+  <div class="btns">
+    <button id="one">Send 1 request</button>
+    <button id="burst" class="danger">Burst ×50</button>
+    <button id="flood" class="wide danger">Flood: off</button>
+    <button id="put" class="wide">Update product (invalidate cache)</button>
+  </div>
+  <p class="tiny" style="margin:10px 0 0">Drag to rotate, scroll to zoom. Tokens refill continuously, so wait a moment after a flood.</p>
+</div>
+
+<div class="panel" id="stats">
+  <div class="row"><span>Token bucket (your IP)</span><b id="toktxt">-</b></div>
+  <div class="meter"><div id="tokfill"></div></div>
+  <hr>
+  <div class="row"><span class="ok">Allowed</span><b id="sAllowed" class="ok">0</b></div>
+  <div class="row"><span class="bad">Blocked (429)</span><b id="sBlocked" class="bad">0</b></div>
+  <div class="row"><span class="cache">Cache HIT</span><b id="sHit" class="cache">0</b></div>
+  <div class="row"><span class="db">Cache MISS</span><b id="sMiss" class="db">0</b></div>
+  <hr>
+  <div class="row"><span>Avg latency, HIT</span><b id="lHit">-</b></div>
+  <div class="row"><span>Avg latency, MISS</span><b id="lMiss">-</b></div>
+  <hr>
+  <div class="row"><span class="tiny">Server: data source reads</span><b id="srvReads">-</b></div>
+  <div class="row"><span class="tiny">Server: cache hit ratio</span><b id="srvRatio">-</b></div>
+</div>
+
+<div class="panel" id="legend">
+  <span><i class="dot" style="background:var(--req)"></i>Request</span>
+  <span><i class="dot" style="background:var(--put)"></i>Update (PUT)</span>
+  <span><i class="dot" style="background:var(--ok)"></i>Allowed</span>
+  <span><i class="dot" style="background:var(--bad)"></i>Blocked</span>
+  <span><i class="dot" style="background:var(--cache)"></i>Redis cache</span>
+  <span><i class="dot" style="background:var(--db)"></i>Data source</span>
+</div>
+
+<div class="panel" id="logbox"><div id="log"></div></div>
+
+<script src="/vendor/three.min.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  if (!window.THREE) { $('nogl').hidden = false; return; }
+
+  const canvas = $('scene');
+  let renderer;
+  try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true }); }
+  catch (e) { $('nogl').hidden = false; return; }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x070b14);
+  scene.fog = new THREE.Fog(0x070b14, 30, 70);
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
+
+  // ---------- camera orbit (drag to rotate, wheel to zoom) ----------
+  const orbit = { theta: 0.45, phi: 1.2, radius: 27 };
+  function placeCamera() {
+    camera.position.set(
+      orbit.radius * Math.sin(orbit.phi) * Math.sin(orbit.theta),
+      orbit.radius * Math.cos(orbit.phi),
+      orbit.radius * Math.sin(orbit.phi) * Math.cos(orbit.theta));
+    camera.lookAt(0, 0, 0);
+  }
+  let dragging = false, lx = 0, ly = 0;
+  canvas.addEventListener('pointerdown', (e) => { dragging = true; lx = e.clientX; ly = e.clientY; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointerup', () => { dragging = false; });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    orbit.theta -= (e.clientX - lx) * 0.006;
+    orbit.phi = Math.min(1.5, Math.max(0.35, orbit.phi - (e.clientY - ly) * 0.006));
+    lx = e.clientX; ly = e.clientY;
+  });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    orbit.radius = Math.min(48, Math.max(12, orbit.radius + e.deltaY * 0.02));
+  }, { passive: false });
+
+  function resize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- scene objects ----------
+  scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+  sun.position.set(6, 12, 9);
+  scene.add(sun);
+
+  const grid = new THREE.GridHelper(70, 70, 0x1b2a4a, 0x0f1a31);
+  grid.position.y = -5.5;
+  scene.add(grid);
+
+  const CLIENT_X = -14, GATE_X = 0, SERVER_X = 10;
+  const cachePos = new THREE.Vector3(SERVER_X, 3.4, -0.5);
+  const dbPos = new THREE.Vector3(SERVER_X, -2.6, 0);
+
+  function makeLabel(text, sub, color) {
+    const c = document.createElement('canvas');
+    c.width = 512; c.height = 160;
+    const g = c.getContext('2d');
+    if (!g) return new THREE.Object3D();
+    g.textAlign = 'center';
+    g.font = '700 54px system-ui, sans-serif'; g.fillStyle = color; g.fillText(text, 256, 70);
+    g.font = '400 32px system-ui, sans-serif'; g.fillStyle = '#8da2c0'; g.fillText(sub, 256, 118);
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }));
+    sprite.scale.set(6.4, 2, 1);
+    return sprite;
+  }
+
+  // Clients: a small cluster of boxes on the left
+  const clients = new THREE.Group();
+  for (let i = 0; i < 4; i++) {
+    const b = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.8, 1.1),
+      new THREE.MeshStandardMaterial({ color: 0x1e3a5f, emissive: 0x0b2a4a, emissiveIntensity: 0.6, metalness: 0.2, roughness: 0.5 }));
+    b.position.set(CLIENT_X - 1.2, -2.2 + i * 1.5, (i % 2 ? 1.4 : -1.4));
+    clients.add(b);
+  }
+  scene.add(clients);
+  const clientLabel = makeLabel('CLIENTS', 'browsers, bots, attackers', '#7dd3fc');
+  clientLabel.position.set(CLIENT_X - 1.2, 5.6, 0);
+  scene.add(clientLabel);
+
+  // Gate: rings + translucent shield disc
+  const gate = new THREE.Group();
+  gate.position.x = GATE_X;
+  const baseGateColor = new THREE.Color(0x38bdf8);
+  const ringMat = new THREE.MeshBasicMaterial({ color: baseGateColor.clone() });
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(3.6, 0.2, 16, 72), ringMat);
+  ring.rotation.y = Math.PI / 2;
+  const ring2 = new THREE.Mesh(new THREE.TorusGeometry(4.1, 0.05, 8, 72), ringMat);
+  ring2.rotation.y = Math.PI / 2;
+  const shieldMat = new THREE.MeshBasicMaterial({ color: baseGateColor.clone(), transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false });
+  const shield = new THREE.Mesh(new THREE.CircleGeometry(3.5, 48), shieldMat);
+  shield.rotation.y = Math.PI / 2;
+  gate.add(ring, ring2, shield);
+  scene.add(gate);
+  const gateLabel = makeLabel('DEVSHIELD', 'token-bucket rate limiter', '#e6edf7');
+  gateLabel.position.set(GATE_X, 6.6, 0);
+  scene.add(gateLabel);
+
+  // Cache + data source
+  const cacheBox = new THREE.Mesh(new THREE.BoxGeometry(3.2, 2.2, 3.2),
+    new THREE.MeshStandardMaterial({ color: 0x0c4a6e, emissive: 0x38bdf8, emissiveIntensity: 0.3, metalness: 0.3, roughness: 0.4 }));
+  cacheBox.position.copy(cachePos);
+  scene.add(cacheBox);
+  const cacheLabel = makeLabel('REDIS CACHE', 'answers in about 1 ms', '#38bdf8');
+  cacheLabel.position.set(SERVER_X, cachePos.y + 2.6, cachePos.z);
+  scene.add(cacheLabel);
+
+  const dbBox = new THREE.Mesh(new THREE.CylinderGeometry(1.7, 1.7, 2.4, 32),
+    new THREE.MeshStandardMaterial({ color: 0x78350f, emissive: 0xfbbf24, emissiveIntensity: 0.3, metalness: 0.3, roughness: 0.4 }));
+  dbBox.position.copy(dbPos);
+  scene.add(dbBox);
+  const dbLabel = makeLabel('DATA SOURCE', 'slow: about 50 ms per read', '#fbbf24');
+  dbLabel.position.set(SERVER_X, dbPos.y - 2.9, dbPos.z);
+  scene.add(dbLabel);
+
+  // Faint lanes so the flow direction is readable
+  function lane(a, b, color) {
+    const g = new THREE.BufferGeometry().setFromPoints([a, b]);
+    scene.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.25 })));
+  }
+  lane(new THREE.Vector3(CLIENT_X, 0, 0), new THREE.Vector3(GATE_X, 0, 0), 0x7dd3fc);
+  lane(new THREE.Vector3(GATE_X, 0, 0), cachePos, 0x38bdf8);
+  lane(new THREE.Vector3(GATE_X, 0, 0), dbPos, 0xfbbf24);
+
+  // ---------- effects ----------
+  const gateFlash = { s: 0, color: new THREE.Color(0xffffff) };
+  function flashGate(hex, strength) {
+    gateFlash.color.set(hex);
+    gateFlash.s = Math.max(gateFlash.s, strength);
+  }
+  function pulse(obj) { obj.userData.pulse = 1; }
+
+  const particles = [];
+  const partGeo = new THREE.TetrahedronGeometry(0.2);
+  function burst(pos, hex) {
+    for (let i = 0; i < 14; i++) {
+      const m = new THREE.Mesh(partGeo, new THREE.MeshBasicMaterial({ color: hex, transparent: true }));
+      m.position.copy(pos);
+      scene.add(m);
+      particles.push({
+        mesh: m, life: 0.8, max: 0.8,
+        vel: new THREE.Vector3((Math.random() - 0.5) * 9, Math.random() * 6 + 1, (Math.random() - 0.5) * 9)
+      });
+    }
+  }
+
+  // ---------- packets ----------
+  const packets = [];
+  const packetGeo = new THREE.BoxGeometry(0.55, 0.55, 0.55);
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+  const COLORS = { GET: 0x7dd3fc, PUT: 0xc084fc, ok: 0x2ee59d, miss: 0xfbbf24, bad: 0xff4d6d, err: 0x64748b };
+
+  function paint(p, hex) {
+    p.mesh.material.color.set(hex);
+    p.mesh.material.emissive.set(hex);
+  }
+
+  function spawnPacket(kind) {
+    const mesh = new THREE.Mesh(packetGeo, new THREE.MeshStandardMaterial({
+      color: COLORS[kind], emissive: COLORS[kind], emissiveIntensity: 0.9, roughness: 0.3 }));
+    const start = new THREE.Vector3(CLIENT_X + 0.5, rand(-2, 2.5), rand(-2.2, 2.2));
+    mesh.position.copy(start);
+    scene.add(mesh);
+    const p = {
+      mesh, kind, start, state: 'approach', t: 0, dur: rand(0.85, 1.15), result: null, wait: 0,
+      gate: new THREE.Vector3(GATE_X, start.y * 0.6, start.z * 0.6),
+      from: new THREE.Vector3(), to: new THREE.Vector3(), vel: new THREE.Vector3(), linger: 0
+    };
+    packets.push(p);
+    return p;
+  }
+
+  function removePacket(i) {
+    const p = packets[i];
+    scene.remove(p.mesh);
+    p.mesh.material.dispose();
+    packets.splice(i, 1);
+  }
+
+  function decide(p) {
+    const r = p.result;
+    if (r.status === 0) { paint(p, COLORS.err); p.state = 'error'; p.t = 0; return; }
+    if (r.status === 429) {
+      flashGate(COLORS.bad, 0.9);
+      paint(p, COLORS.bad);
+      p.state = 'bounce'; p.t = 0;
+      p.vel.set(-rand(6, 9), rand(3, 6), rand(-3, 3));
+      return;
+    }
+    flashGate(COLORS.ok, 0.4);
+    const toDb = r.kind === 'PUT' || !r.hit;
+    paint(p, r.kind === 'PUT' ? COLORS.PUT : (r.hit ? COLORS.ok : COLORS.miss));
+    p.from.copy(p.mesh.position);
+    p.to.copy(toDb ? dbPos : cachePos);
+    p.dur = 0.7; p.t = 0; p.state = 'toTarget';
+  }
+
+  function updatePackets(dt) {
+    for (let i = packets.length - 1; i >= 0; i--) {
+      const p = packets[i], m = p.mesh;
+      m.rotation.x += dt * 3; m.rotation.y += dt * 2;
+      switch (p.state) {
+        case 'approach':
+          p.t += dt / p.dur;
+          m.position.lerpVectors(p.start, p.gate, Math.min(p.t, 1));
+          if (p.t >= 1) { if (p.result) decide(p); else { p.state = 'wait'; p.wait = 0; } }
+          break;
+        case 'wait':
+          p.wait += dt;
+          m.position.y = p.gate.y + Math.sin(p.wait * 14) * 0.08;
+          if (p.result) decide(p); else if (p.wait > 10) removePacket(i);
+          break;
+        case 'toTarget':
+          p.t += dt / p.dur;
+          m.position.lerpVectors(p.from, p.to, easeOut(Math.min(p.t, 1)));
+          if (p.t >= 1) {
+            const toDb = p.result.kind === 'PUT' || !p.result.hit;
+            pulse(toDb ? dbBox : cacheBox);
+            if (p.result.kind === 'PUT') { pulse(cacheBox); cacheBox.userData.inval = 1; }
+            p.linger = toDb ? 0.5 : 0.05;
+            p.state = 'linger';
+          }
+          break;
+        case 'linger':
+          p.linger -= dt;
+          if (p.linger <= 0) {
+            p.from.copy(m.position);
+            p.to.set(CLIENT_X + 1.5, p.start.y, p.start.z);
+            p.dur = 1.0; p.t = 0; p.state = 'toBack';
+          }
+          break;
+        case 'toBack':
+          p.t += dt / p.dur;
+          m.position.lerpVectors(p.from, p.to, Math.min(p.t, 1));
+          m.scale.setScalar(Math.max(0.3, 1 - p.t * 0.6));
+          if (p.t >= 1) removePacket(i);
+          break;
+        case 'bounce':
+          p.t += dt;
+          m.position.addScaledVector(p.vel, dt);
+          p.vel.y -= 9 * dt;
+          if (p.t > 0.45) { burst(m.position, COLORS.bad); removePacket(i); }
+          break;
+        case 'error':
+          p.t += dt;
+          m.scale.setScalar(Math.max(0.01, 1 - p.t * 2));
+          if (p.t > 0.5) removePacket(i);
+          break;
+      }
+    }
+  }
+
+  function updateEffects(dt) {
+    gateFlash.s = Math.max(0, gateFlash.s - dt * 1.6);
+    const k = Math.min(1, gateFlash.s * 2);
+    shieldMat.opacity = 0.08 + 0.5 * gateFlash.s;
+    shieldMat.color.copy(baseGateColor).lerp(gateFlash.color, k);
+    ringMat.color.copy(baseGateColor).lerp(gateFlash.color, k);
+    ring.rotation.x += dt * 0.25;
+
+    for (const box of [cacheBox, dbBox]) {
+      const u = box.userData;
+      u.pulse = Math.max(0, (u.pulse || 0) - dt * 2.2);
+      box.scale.setScalar(1 + 0.12 * u.pulse);
+      box.material.emissiveIntensity = 0.3 + 1.1 * u.pulse;
+    }
+    // Cache invalidation: briefly tint the cache box red
+    const inv = Math.max(0, (cacheBox.userData.inval || 0) - dt * 1.5);
+    cacheBox.userData.inval = inv;
+    cacheBox.material.emissive.set(0x38bdf8).lerp(new THREE.Color(COLORS.bad), inv);
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const q = particles[i];
+      q.life -= dt;
+      q.vel.y -= 9 * dt;
+      q.mesh.position.addScaledVector(q.vel, dt);
+      q.mesh.rotation.x += dt * 8;
+      q.mesh.material.opacity = Math.max(0, q.life / q.max);
+      if (q.life <= 0) { scene.remove(q.mesh); q.mesh.material.dispose(); particles.splice(i, 1); }
+    }
+  }
+
+  // ---------- stats / UI ----------
+  const stats = { allowed: 0, blocked: 0, hit: 0, miss: 0, hitMs: [], missMs: [] };
+  const bucket = { cap: 20, refill: 10, value: 20, ts: performance.now() };
+  const avg = (a) => a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) + ' ms' : '-';
+
+  function renderStats() {
+    $('sAllowed').textContent = stats.allowed;
+    $('sBlocked').textContent = stats.blocked;
+    $('sHit').textContent = stats.hit;
+    $('sMiss').textContent = stats.miss;
+    $('lHit').textContent = avg(stats.hitMs);
+    $('lMiss').textContent = avg(stats.missMs);
+  }
+  function renderBucket() {
+    const now = performance.now();
+    const cur = Math.min(bucket.cap, bucket.value + ((now - bucket.ts) / 1000) * bucket.refill);
+    $('tokfill').style.width = (cur / bucket.cap * 100).toFixed(1) + '%';
+    $('tokfill').classList.toggle('low', cur < bucket.cap * 0.25);
+    $('toktxt').textContent = Math.floor(cur) + ' / ' + bucket.cap;
+  }
+  function log(text, cls) {
+    const el = document.createElement('div');
+    el.className = cls; el.textContent = text;
+    const box = $('log');
+    box.prepend(el);
+    while (box.children.length > 9) box.removeChild(box.lastChild);
+  }
+  let toastTimer;
+  function toast(msg) {
+    const t = $('toast'); t.textContent = msg; t.classList.add('show');
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+  }
+
+  async function pollMetrics() {
+    try {
+      const m = await (await fetch('/metrics')).json();
+      if (m.config) { bucket.cap = m.config.capacity; bucket.refill = m.config.refillPerSec; }
+      $('srvReads').textContent = m.dbReads;
+      $('srvRatio').textContent = (m.cacheHitRatio * 100).toFixed(1) + '%';
+    } catch (e) { /* server not reachable yet */ }
+  }
+
+  // ---------- sending real requests ----------
+  function productId() {
+    const v = $('prod').value;
+    return v === 'rand' ? 1 + Math.floor(Math.random() * 100) : v;
+  }
+
+  async function send(kind) {
+    if (packets.length > 250) return;
+    const id = productId();
+    const p = spawnPacket(kind);
+    const t0 = performance.now();
+    const label = (kind === 'PUT' ? 'PUT ' : 'GET ') + '/api/products/' + id;
+    try {
+      const opts = kind === 'PUT' ? {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ price: Math.round(rand(10, 900)) })
+      } : {};
+      const res = await fetch('/api/products/' + id, opts);
+      const ms = performance.now() - t0;
+      const hit = res.headers.get('X-Cache') === 'HIT';
+      const rem = res.headers.get('X-RateLimit-Remaining');
+      if (rem !== null) { bucket.value = Number(rem); bucket.ts = performance.now(); }
+      p.result = { status: res.status, hit, kind, ms };
+      if (res.status === 429) {
+        stats.blocked++; bucket.value = 0; bucket.ts = performance.now();
+        log(label + '  ->  429 BLOCKED', 'bad');
+      } else {
+        stats.allowed++;
+        if (kind === 'GET') {
+          if (hit) { stats.hit++; stats.hitMs.push(ms); } else { stats.miss++; stats.missMs.push(ms); }
+          if (stats.hitMs.length > 200) stats.hitMs.shift();
+          if (stats.missMs.length > 200) stats.missMs.shift();
+        }
+        const tag = kind === 'PUT' ? 'UPDATED, cache invalidated' : (hit ? 'HIT' : 'MISS');
+        log(label + '  ->  ' + res.status + ' ' + tag + '  ' + Math.round(ms) + 'ms', 'ok');
+        if (kind === 'PUT') toast('Cache entry deleted. The next read will be a MISS.');
+      }
+      renderStats();
+    } catch (e) {
+      p.result = { status: 0, kind, hit: false, ms: 0 };
+      log(label + '  ->  network error', 'bad');
+    }
+  }
+
+  $('one').onclick = () => send('GET');
+  $('put').onclick = () => send('PUT');
+  $('burst').onclick = () => {
+    let n = 0;
+    const iv = setInterval(() => { send('GET'); if (++n >= 50) clearInterval(iv); }, 15);
+  };
+  let floodTimer = null;
+  $('flood').onclick = () => {
+    const btn = $('flood');
+    if (floodTimer) { clearInterval(floodTimer); floodTimer = null; btn.textContent = 'Flood: off'; btn.classList.remove('on'); }
+    else { floodTimer = setInterval(() => send('GET'), 40); btn.textContent = 'Flood: ON (25 req/s), click to stop'; btn.classList.add('on'); }
+  };
+
+  // ---------- main loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    updatePackets(dt);
+    updateEffects(dt);
+    renderBucket();
+    placeCamera();
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  resize();
+  pollMetrics();
+  setInterval(pollMetrics, 1500);
+  renderStats();
+  requestAnimationFrame(frame);
+
+  // Exposed only so automated checks can inspect state.
+  window.__devshield = { packets, particles, stats, bucket };
+})();
+</script>
+</body>
+</html>
