@@ -7,8 +7,8 @@ module.exports = {
   // Token bucket: each client can burst up to `capacity` requests,
   // and earns `refillPerSec` tokens back every second.
   rateLimit: {
-    capacity: Number(process.env.RL_CAPACITY || 50),
-    refillPerSec: Number(process.env.RL_REFILL_PER_SEC || 50),
+    capacity: Number(process.env.RL_CAPACITY || 20),
+    refillPerSec: Number(process.env.RL_REFILL_PER_SEC || 10),
   },
 
   cache: {
